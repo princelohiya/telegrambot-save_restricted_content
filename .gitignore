@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Downloaded media staging area
+downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.session
+*.session-journal
+*.log
+.venv/
+venv/
