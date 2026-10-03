@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 import uuid
@@ -23,8 +24,15 @@ from typing import Any, Awaitable, Callable
 
 from pyrogram import Client
 from pyrogram.errors import FloodWait, MessageIdsEmpty
+from pyrogram.file_id import FileId
 
-from config import DOWNLOAD_TIMEOUT, MAX_FILE_SIZE, TEMP_DOWNLOAD_DIR
+from config import (
+    DOWNLOAD_PART_BATCH,
+    DOWNLOAD_TIMEOUT,
+    DOWNLOAD_WORKERS,
+    MAX_FILE_SIZE,
+    TEMP_DOWNLOAD_DIR,
+)
 
 log = logging.getLogger(__name__)
 
@@ -129,13 +137,6 @@ async def download_media(
         if progress:
             await progress(current, total)
 
-    async def _download_once() -> str:
-        return await user.download_media(
-            message,
-            file_name=target_path,
-            progress=_track,
-        )
-
     async def _watchdog(task: asyncio.Task) -> None:
         """Cancel `task` if no progress happened for DOWNLOAD_TIMEOUT s."""
         while True:
@@ -145,9 +146,9 @@ async def download_media(
                 task.cancel()
                 return
 
-    async def _guarded_download() -> str:
-        """Run the download under watchdog supervision."""
-        task = asyncio.create_task(_download_once())
+    async def _supervise(factory: Callable[[], Any]) -> str:
+        """Run a download coroutine under watchdog supervision."""
+        task = asyncio.create_task(factory())
         watchdog = asyncio.create_task(_watchdog(task))
         try:
             return await task
@@ -165,18 +166,130 @@ async def download_media(
             except asyncio.CancelledError:
                 pass
 
-    # ---- run with a single FloodWait retry ------------------------------ #
+    async def _fast_download() -> str:
+        """Parallel-segment download via multiple media connections."""
+        return await _parallel_download(
+            user, media, target_path, file_size or 0, _track
+        )
+
+    async def _stock_download() -> str:
+        """Pyrogram's built-in (single-connection) downloader."""
+        return await user.download_media(
+            message,
+            file_name=target_path,
+            progress=_track,
+        )
+
+    async def _fallback() -> str:
+        """Clean up any partial fast-path output, then run the stock path."""
+        try:
+            os.remove(target_path)
+        except OSError:
+            pass
+        return await _stock_download()
+
+    # ---- fast path first, stock downloader as safety net ----------------- #
     try:
-        path = await _guarded_download()
-    except FloodWait as e:
-        log.warning("FloodWait %ss during download; retrying once.", e.value)
-        await asyncio.sleep(e.value + 1)
-        path = await _guarded_download()
+        path = await _supervise(_fast_download)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 — any fast-path failure is recoverable
+        log.warning(
+            "Parallel download failed (%s: %s) — falling back to stock downloader.",
+            type(e).__name__, e,
+        )
+        try:
+            path = await _supervise(_fallback)
+        except FloodWait as e:
+            log.warning("FloodWait %ss during download; retrying once.", e.value)
+            await asyncio.sleep(e.value + 1)
+            path = await _supervise(_fallback)
 
     if not path or not os.path.exists(path):
         raise RuntimeError("Download finished but the file is missing on disk.")
 
     return _describe(message, media, path)
+
+
+async def _parallel_download(
+    user: Client,
+    media: Any,
+    target_path: str,
+    file_size: int,
+    track: ProgressCallback,
+) -> str:
+    """
+    Download a file using several concurrent media connections.
+
+    The stock downloader pulls 1 MiB chunks strictly sequentially over a
+    single session. This splits the file into DOWNLOAD_PART_BATCH-chunk
+    segments and fetches DOWNLOAD_WORKERS segments simultaneously through
+    `Client.get_file` (which internally handles auth export, media sessions
+    and CDN redirects). Segments are written at their byte offsets, so
+    out-of-order completion is fine.
+
+    Raises on any problem — the caller falls back to the stock downloader.
+    """
+    if not file_size or file_size <= 0:
+        raise RuntimeError("Unknown file size — parallel download unavailable.")
+
+    chunk_size = 1024 * 1024
+    total_parts = max(1, math.ceil(file_size / chunk_size))
+    workers = max(1, min(DOWNLOAD_WORKERS, total_parts))
+    batch = max(1, DOWNLOAD_PART_BATCH)
+
+    file_id = FileId.decode(media.file_id)
+
+    # Preallocate the final size so every worker can seek-and-write its slice.
+    with open(target_path, "wb") as f:
+        f.truncate(file_size)
+
+    segments: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
+    for start in range(0, total_parts, batch):
+        segments.put_nowait((start, min(batch, total_parts - start)))
+
+    done = 0
+
+    async def worker() -> None:
+        nonlocal done
+        f = open(target_path, "r+b")
+        try:
+            while True:
+                try:
+                    start, count = segments.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+                buf = bytearray()
+                async for chunk in user.get_file(file_id, file_size, count, start):
+                    buf += chunk
+                    done += len(chunk)
+                    await track(min(done, file_size), file_size)
+
+                # A short mid-file segment means Telegram returned less data
+                # than requested — writing it would silently corrupt the
+                # sparse file. Bail out and let the caller fall back.
+                last_part = start + count
+                expected = count * chunk_size
+                if len(buf) != expected and last_part * chunk_size <= file_size:
+                    raise RuntimeError(
+                        f"Short segment {start}: got {len(buf)} of {expected} bytes."
+                    )
+
+                if not buf:
+                    raise RuntimeError(f"Empty segment {start} from Telegram.")
+
+                f.seek(start * chunk_size)
+                f.write(buf)
+                segments.task_done()
+        finally:
+            f.close()
+
+    await asyncio.gather(*(worker() for _ in range(workers)))
+
+    if os.path.getsize(target_path) != file_size:
+        raise RuntimeError("Size mismatch after parallel download.")
+    return target_path
 
 
 async def download_thumb(user: Client, message: Any) -> str | None:

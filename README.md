@@ -155,6 +155,8 @@ a fresh, unrestricted upload in the same chat.
 | `QUEUE_MAX_SIZE` | ✖ | `100` | Pending jobs before the bot starts refusing |
 | `DOWNLOAD_TIMEOUT` | ✖ | `300` | Seconds without progress before a download is aborted |
 | `MAX_FILE_SIZE` | ✖ | `2147483648` | Max media size in bytes (2 GiB) |
+| `DOWNLOAD_WORKERS` | ✖ | `6` | Parallel connections used to download one file |
+| `DOWNLOAD_PART_BATCH` | ✖ | `16` | 1 MiB chunks per connection per segment (16 = 16 MiB) |
 
 ---
 
@@ -165,7 +167,7 @@ a fresh, unrestricted upload in the same chat.
 | `ChannelPrivate` on a private link | The **user** account must be a member of that channel. Join it first. |
 | `CHAT_WRITE_FORBIDDEN` from the bot | You haven't pressed **Start** on the bot. |
 | `AUTH_KEY_UNREGISTERED` | Session string is stale/revoked — regenerate it. |
-| Slow downloads | Make sure `TgCrypto` installed successfully (see pip output). |
+| Slow downloads | Make sure `TgCrypto` installed successfully (see pip output). Media is fetched over several parallel connections (`DOWNLOAD_WORKERS`); if your ISP link to Telegram is the bottleneck (measure ~3 MiB/s on a single stream), more connections won't help — only a faster network will. |
 | `File too large` | Raise `MAX_FILE_SIZE` or split your request. |
 
 ---

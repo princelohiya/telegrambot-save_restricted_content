@@ -80,6 +80,16 @@ QUEUE_MAX_SIZE: int = int(os.getenv("QUEUE_MAX_SIZE", "100"))
 # Seconds of download inactivity after which a stalled transfer is aborted.
 DOWNLOAD_TIMEOUT: int = int(os.getenv("DOWNLOAD_TIMEOUT", "300"))
 
+# Parallel download connections (each streams 1 MiB chunks from Telegram).
+# 4-8 gives a near-linear speedup on typical home links; too high may trip
+# network/FloodWait limits. Must be <= max_concurrent_transmissions of the user client.
+DOWNLOAD_WORKERS: int = int(os.getenv("DOWNLOAD_WORKERS", "6"))
+
+# Chunks (1 MiB each) per parallel segment: 16 => every connection grabs a
+# 16 MiB slice before moving to the next. Bigger = fewer session handshakes,
+# slightly laggier progress.
+DOWNLOAD_PART_BATCH: int = int(os.getenv("DOWNLOAD_PART_BATCH", "16"))
+
 # Seconds of upload inactivity after which a stalled upload is aborted.
 # (pyrogram send_* has no built-in timeout — a wedged upload would hang forever.)
 UPLOAD_STALL_TIMEOUT: int = int(os.getenv("UPLOAD_STALL_TIMEOUT", "120"))

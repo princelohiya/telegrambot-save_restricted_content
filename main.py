@@ -42,7 +42,14 @@ from pyrogram.errors import (
 )
 from pyrogram.types import Message
 
-from config import API_HASH, API_ID, BOT_TOKEN, QUEUE_MAX_SIZE, SESSION_STRING
+from config import (
+    API_HASH,
+    API_ID,
+    BOT_TOKEN,
+    DOWNLOAD_WORKERS,
+    QUEUE_MAX_SIZE,
+    SESSION_STRING,
+)
 from downloader import download_media, download_thumb, fetch_message, get_media
 from parser import ParsedLink, extract_links, parse_link
 from sender import send_media, send_text
@@ -117,7 +124,9 @@ def _make_progress(job: Job, label: str):
             )
 
         # Telegram: edit the status message (throttled, best-effort).
-        if now - state["last_edit"] < 4:
+        # 15 s spacing keeps edit traffic far below flood limits — progress
+        # spam earlier triggered multi-minute FloodWaits that stalled jobs.
+        if now - state["last_edit"] < 15:
             return
         state["last_edit"] = now
 
@@ -479,6 +488,8 @@ async def main() -> None:
         api_hash=API_HASH,
         session_string=SESSION_STRING,
         in_memory=True,
+        # Upper bound for the parallel downloader's media connections.
+        max_concurrent_transmissions=DOWNLOAD_WORKERS,
     )
 
     register_handlers()
